@@ -1,110 +1,131 @@
-use std::collections::HashMap;
+use std::borrow::Cow;
 use std::sync::Arc;
 
+// use anyhow::Context;
+use fast_socks5::{server::Socks5ServerProtocol, ReplyError, Result, Socks5Command, SocksError};
 use log::{debug, error, info};
 use russh::keys::{Certificate, *};
 use russh::server::{run_stream, Msg, Server as _, Session};
 use russh::*;
 use ssh_key::private::{Ed25519Keypair, KeypairData};
-use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use std::time::Duration;
+use tokio::net::{self, TcpListener};
+// use tokio::sync::Mutex;
+use tokio::task;
 
-// #[tokio::main]
-// async fn main() {
-//     env_logger::builder()
-//         .filter_level(log::LevelFilter::Debug)
-//         .init();
-//
-//     // Testing hardcoded key
-//     let key = PrivateKey::new(
-//         KeypairData::Ed25519(Ed25519Keypair::from_seed(&[0; 32])),
-//         "",
-//     )
-//     .unwrap();
-//     let config = russh::server::Config {
-//         inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
-//         auth_rejection_time: std::time::Duration::from_secs(3),
-//         auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
-//         // keys: vec![russh::keys::PrivateKey::random(
-//         //     &mut rand::rng(),
-//         //     russh::keys::Algorithm::Ed25519,
-//         // )
-//         // .unwrap()],
-//         keys: vec![key],
-//         preferred: Preferred {
-//             // kex: std::borrow::Cow::Owned(vec![russh::kex::DH_GEX_SHA256]),
-//             ..Preferred::default()
-//         },
-//         ..Default::default()
-//     };
-//     let config = Arc::new(config);
-//     let mut sh = Server {
-//         clients: Arc::new(Mutex::new(HashMap::new())),
-//         id: 0,
-//     };
-//
-//     let socket = TcpListener::bind(("0.0.0.0", 2222)).await.unwrap();
-//     let server = sh.run_on_socket(config, &socket);
-//     let handle = server.handle();
-//
-//     tokio::spawn(async move {
-//         tokio::time::sleep(std::time::Duration::from_secs(600)).await;
-//         handle.shutdown("Server shutting down after 10 minutes".into());
-//     });
-//
-//     server.await.unwrap()
-// }
-//
+use fast_socks5::server::ErrorContext;
+use fast_socks5::server::{states, SocksServerError};
+use fast_socks5::util::stream::tcp_connect_with_timeout;
+use fast_socks5::util::target_addr::{AddrError, TargetAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as StdToSocketAddrs};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+#[derive(Clone)]
+struct Config {
+    ssh_server: Arc<russh::server::Config>,
+    ssh_client: Arc<russh::client::Config>,
+    outbound_client_key: Arc<PrivateKey>,
+}
+
 #[derive(Clone)]
 struct Server {
-    config: Arc<russh::server::Config>,
-    clients: Arc<Mutex<HashMap<usize, (ChannelId, russh::server::Handle)>>>,
-    id: usize,
+    // clients: Arc<Mutex<HashMap<usize, (ChannelId, russh::server::Handle)>>>,
+    // id: usize,
 }
 
-impl Server {
-    async fn post(&mut self, data: Vec<u8>) {
-        let mut clients = self.clients.lock().await;
-        for (id, (channel, s)) in clients.iter_mut() {
-            if *id != self.id {
-                let _ = s.data(*channel, data.clone()).await;
-            }
-        }
+// impl Server {
+//     async fn post(&mut self, data: Vec<u8>) {
+//         let mut clients = self.clients.lock().await;
+//         for (id, (channel, s)) in clients.iter_mut() {
+//             if *id != self.id {
+//                 let _ = s.data(*channel, data.clone()).await;
+//             }
+//         }
+//     }
+// }
+
+// impl server::Server for Server {
+//     type Handler = Handler;
+//     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
+//         Handler {}
+//     }
+//     fn handle_session_error(&mut self, _error: <Self::Handler as russh::server::Handler>::Error) {
+//         eprintln!("Session error: {_error:#?}");
+//     }
+// }
+
+struct Client {}
+
+// More SSH event handlers
+// can be defined in this trait
+// In this example, we're only using Channel, so these aren't needed.
+impl client::Handler for Client {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        // TODO: TOFU like OpenSSH
+        Ok(true)
     }
 }
 
-impl server::Server for Server {
-    type Handler = Self;
-    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
-        let s = self.clone();
-        self.id += 1;
-        s
-    }
-    fn handle_session_error(&mut self, _error: <Self::Handler as russh::server::Handler>::Error) {
-        eprintln!("Session error: {_error:#?}");
-    }
+// #[derive(Clone)]
+struct Handler {
+    outbound_client_key: Arc<PrivateKey>,
+    outbound_session: russh::client::Handle<Client>,
 }
 
-impl server::Handler for Server {
+// impl Handler {
+//     fn new() -> Self {
+//         Self {}
+//     }
+// }
+
+impl server::Handler for Handler {
     type Error = russh::Error;
 
     async fn channel_open_session(
         &mut self,
-        channel: Channel<Msg>,
-        session: &mut Session,
+        _channel: Channel<Msg>,
+        _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        {
-            let mut clients = self.clients.lock().await;
-            clients.insert(self.id, (channel.id(), session.handle()));
-        }
+        info!("DBG channel_open_session");
+        // {
+        //     let mut clients = self.clients.lock().await;
+        //     clients.insert(self.id, (channel.id(), session.handle()));
+        // }
         Ok(true)
     }
 
     async fn auth_publickey(
         &mut self,
-        _: &str,
-        _key: &ssh_key::PublicKey,
+        user: &str,
+        key: &ssh_key::PublicKey,
     ) -> Result<server::Auth, Self::Error> {
+        info!(
+            "DBG auth_publickey user={}, key={}",
+            user,
+            key.to_openssh().unwrap()
+        );
+        let auth_res = self
+            .outbound_session
+            .authenticate_publickey(
+                user,
+                PrivateKeyWithHashAlg::new(
+                    self.outbound_client_key.clone(),
+                    self.outbound_session
+                        .best_supported_rsa_hash()
+                        .await?
+                        .flatten(),
+                ),
+            )
+            .await?;
+
+        if !auth_res.success() {
+            panic!("Authentication (with publickey) failed");
+        }
         Ok(server::Auth::Accept)
     }
 
@@ -113,6 +134,7 @@ impl server::Handler for Server {
         _user: &str,
         _certificate: &Certificate,
     ) -> Result<server::Auth, Self::Error> {
+        info!("DBG auth_openssh_certificate");
         Ok(server::Auth::Accept)
     }
 
@@ -122,67 +144,34 @@ impl server::Handler for Server {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!("exec_request: {}", String::from_utf8_lossy(data));
+        info!("DBG exec_request: {}", String::from_utf8_lossy(data));
         session.channel_success(channel)
     }
 
     async fn data(
         &mut self,
-        channel: ChannelId,
+        _channel: ChannelId,
         data: &[u8],
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Sending Ctrl+C ends the session and disconnects the client
-        if data == [3] {
-            return Err(russh::Error::Disconnect);
-        }
-
-        info!("data: {}", String::from_utf8_lossy(data));
-        let data = format!("Got data: {}\r\n", String::from_utf8_lossy(data)).into_bytes();
-        self.post(data.clone()).await;
-        session.data(channel, data)?;
+        info!("DBG data: {}", String::from_utf8_lossy(data));
+        // let data = format!("Got data: {}\r\n", String::from_utf8_lossy(data)).into_bytes();
+        // self.post(data.clone()).await;
+        // session.data(channel, data)?;
         Ok(())
     }
-
-    async fn tcpip_forward(
-        &mut self,
-        address: &str,
-        port: &mut u32,
-        session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        let handle = session.handle();
-        let address = address.to_string();
-        let port = *port;
-        tokio::spawn(async move {
-            let channel = handle
-                .channel_open_forwarded_tcpip(address, port, "1.2.3.4", 1234)
-                .await
-                .unwrap();
-            let _ = channel.data(&b"Hello from a forwarded port"[..]).await;
-            let _ = channel.eof().await;
-        });
-        Ok(true)
-    }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        let id = self.id;
-        let clients = self.clients.clone();
-        tokio::spawn(async move {
-            let mut clients = clients.lock().await;
-            clients.remove(&id);
-        });
-    }
-}
-
-// use anyhow::Context;
-use fast_socks5::{
-    server::{DnsResolveHelper as _, Socks5ServerProtocol},
-    ReplyError, Result, Socks5Command, SocksError,
-};
-use std::{future::Future, time::Duration};
-use tokio::task;
+// impl Drop for Server {
+//     fn drop(&mut self) {
+//         let id = self.id;
+//         let clients = self.clients.clone();
+//         tokio::spawn(async move {
+//             let mut clients = clients.lock().await;
+//             clients.remove(&id);
+//         });
+//     }
+// }
 
 /// # How to use it:
 ///
@@ -243,56 +232,67 @@ use tokio::task;
 //     Ok(Duration::from_secs_f64(seconds))
 // }
 
-/// Useful read 1. https://blog.yoshuawuyts.com/rust-streams/
-/// Useful read 2. https://blog.yoshuawuyts.com/futures-concurrency/
-/// Useful read 3. https://blog.yoshuawuyts.com/streams-concurrency/
-/// error-libs benchmark: https://blog.yoshuawuyts.com/error-handling-survey/
-///
-/// TODO: Write functional tests: https://github.com/ark0f/async-socks5/blob/master/src/lib.rs#L762
-/// TODO: Write functional tests with cURL?
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
 
-    spawn_socks_server().await
-}
-
-async fn spawn_socks_server() -> Result<()> {
     let addr = "0.0.0.0:2324";
     let listener = TcpListener::bind(addr).await?;
 
     info!("Listen for socks connections @ {}", addr);
 
     // Testing hardcoded key
-    let key = PrivateKey::new(
+    let server_key = PrivateKey::new(
         KeypairData::Ed25519(Ed25519Keypair::from_seed(&[0; 32])),
         "",
     )
     .unwrap();
+    let client_key = PrivateKey::new(
+        KeypairData::Ed25519(Ed25519Keypair::from_seed(&[1; 32])),
+        "",
+    )
+    .unwrap();
 
-    let config = russh::server::Config {
+    let config_ssh_server = russh::server::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         auth_rejection_time: Duration::from_secs(3),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
-        keys: vec![key],
+        keys: vec![server_key],
         preferred: Preferred {
             // kex: std::borrow::Cow::Owned(vec![russh::kex::DH_GEX_SHA256]),
             ..Preferred::default()
         },
         ..Default::default()
     };
-    let config = Arc::new(config);
-    let sh = Server {
-        config,
-        clients: Arc::new(Mutex::new(HashMap::new())),
-        id: 0,
+    let config_ssh_client = client::Config {
+        inactivity_timeout: Some(Duration::from_secs(5)),
+        preferred: Preferred {
+            kex: Cow::Owned(vec![
+                russh::kex::CURVE25519_PRE_RFC_8731,
+                russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+            ]),
+            ..Default::default()
+        },
+        ..<_>::default()
+    };
+
+    let config = Config {
+        ssh_server: Arc::new(config_ssh_server),
+        ssh_client: Arc::new(config_ssh_client),
+        outbound_client_key: Arc::new(client_key),
     };
 
     // Standard TCP loop
     loop {
         match listener.accept().await {
             Ok((socket, _client_addr)) => {
-                spawn_and_log_error(serve_socks5(socket, sh.clone()));
+                let config = config.clone();
+                task::spawn(async move {
+                    match serve_socks5(socket, config).await {
+                        Ok(()) => {}
+                        Err(err) => error!("{:#}", &err),
+                    }
+                });
             }
             Err(err) => {
                 error!("accept error = {:?}", err);
@@ -301,17 +301,34 @@ async fn spawn_socks_server() -> Result<()> {
     }
 }
 
-async fn serve_socks5(socket: tokio::net::TcpStream, sh: Server) -> Result<(), SocksError> {
+async fn serve_socks5(socket: tokio::net::TcpStream, config: Config) -> Result<(), SocksError> {
     let (proto, cmd, target_addr) = Socks5ServerProtocol::accept_no_auth(socket)
         .await?
         .read_command()
         .await?;
-    info!("accept socks5 to {}", target_addr);
-    let target_addr = target_addr.resolve_dns().await?;
+    info!("DBG accept socks5 to {}", target_addr);
+
+    let socket_addrs = match target_addr {
+        TargetAddr::Ip(ip) => vec![ip],
+        TargetAddr::Domain(domain, port) => {
+            debug!("Attempt to DNS resolve the domain {}...", &domain);
+
+            let socket_addrs: Vec<_> = net::lookup_host((&domain[..], port))
+                .await
+                .map_err(|err| AddrError::DNSResolutionFailed(err))?
+                .collect();
+            if socket_addrs.is_empty() {
+                return Err(AddrError::NoDNSRecords)?;
+            }
+            debug!("domain name resolved to {:?}", socket_addrs);
+            socket_addrs
+        }
+    };
 
     match cmd {
         Socks5Command::TCPConnect => {
-            run_tcp_proxy(proto, &target_addr, sh).await?;
+            // TODO: Duration from config
+            run_tcp_proxy(proto, &socket_addrs, config, Duration::from_secs(5)).await?;
         }
         _ => {
             proto.reply_error(&ReplyError::CommandNotSupported).await?;
@@ -320,25 +337,6 @@ async fn serve_socks5(socket: tokio::net::TcpStream, sh: Server) -> Result<(), S
     };
     Ok(())
 }
-
-fn spawn_and_log_error<F>(fut: F) -> task::JoinHandle<()>
-where
-    F: Future<Output = Result<()>> + Send + 'static,
-{
-    task::spawn(async move {
-        match fut.await {
-            Ok(()) => {}
-            Err(err) => error!("{:#}", &err),
-        }
-    })
-}
-
-use fast_socks5::server::ErrorContext;
-use fast_socks5::server::{states, SocksServerError};
-// use fast_socks5::util::stream::tcp_connect_with_timeout;
-use fast_socks5::util::target_addr::TargetAddr;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as StdToSocketAddrs};
-use tokio::io::{AsyncRead, AsyncWrite};
 
 macro_rules! try_notify {
     ($proto:expr, $e:expr) => {
@@ -373,26 +371,24 @@ where
 /// Handle the connect command by running a TCP proxy until the connection is done.
 async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     proto: Socks5ServerProtocol<T, states::CommandRead>,
-    addr: &TargetAddr,
-    mut sh: Server,
-    // request_timeout: Duration,
+    addrs: &[SocketAddr],
+    config: Config,
+    request_timeout: Duration,
     // nodelay: bool,
 ) -> Result<(), SocksServerError> {
-    let _addr = try_notify!(
-        proto,
-        addr.to_socket_addrs()
-            .err_when("converting to socket addr")
-            .and_then(|mut addrs| addrs.next().ok_or(SocksServerError::Bug("no socket addrs")))
-    );
+    // let _addr = try_notify!(
+    //     proto,
+    //     addr.to_socket_addrs()
+    //         .err_when("converting to socket addr")
+    //         .and_then(|mut addrs| addrs.next().ok_or(SocksServerError::Bug("no socket addrs")))
+    // );
 
     // TCP connect with timeout, to avoid memory leak for connection that takes forever
-    // let outbound = match tcp_connect_with_timeout(addr, request_timeout).await {
-    //     Ok(stream) => stream,
-    //     Err(err) => {
-    //         proto.reply_error(&err.to_reply_error()).await?;
-    //         return Err(err.into());
-    //     }
-    // };
+    // TODO: Use the other addrs if the first one fails
+    let outbound_stream = try_notify!(
+        proto,
+        tcp_connect_with_timeout(addrs[0], request_timeout).await
+    );
 
     // // Disable Nagle's algorithm if config specifies to do so.
     // try_notify!(
@@ -402,21 +398,48 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     // debug!("Connected to remote destination");
 
-    let inner = proto
-        .reply_success(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0))
+    let inbound_stream = proto
+        .reply_success(outbound_stream.local_addr().expect("ok"))
         .await?;
 
-    let handler = sh.new_client(None);
-    let session = match run_stream(sh.config.clone(), inner, handler).await {
+    let ssh_client = Client {};
+    let outbound_session =
+        match russh::client::connect_stream(config.ssh_client, outbound_stream, ssh_client).await {
+            Ok(s) => s,
+            Err(e) => {
+                panic!("Connection setup failed: {}", e);
+            }
+        };
+
+    // TODO
+    // let auth_res = session
+    //     .authenticate_publickey(
+    //         user,
+    //         PrivateKeyWithHashAlg::new(
+    //             Arc::new(key_pair),
+    //             session.best_supported_rsa_hash().await?.flatten(),
+    //         ),
+    //     )
+    //     .await?;
+
+    // if !auth_res.success() {
+    //     anyhow::bail!("Authentication (with publickey) failed");
+    // }
+
+    let handler = Handler {
+        outbound_client_key: config.outbound_client_key,
+        outbound_session,
+    };
+    let inbound_session = match run_stream(config.ssh_server, inbound_stream, handler).await {
         Ok(s) => s,
         Err(e) => {
             panic!("Connection setup failed: {}", e);
         }
     };
-    let _handle = session.handle();
+    let _handle = inbound_session.handle();
 
     tokio::select! {
-        result = session => {
+        result = inbound_session => {
             if let Err(e) = result {
                 panic!("Connection closed with error: {}", e);
             } else {

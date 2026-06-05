@@ -14,3 +14,10 @@ The goal of this project is to enable development environments to run in a sandb
 # Status
 
 Currently the repository is just a skeleton of a server that accepts ssh connections over socks5 and shows logs of what's happening.
+
+# Testing
+
+Example:
+```
+GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/tmp/proxy-ssh-known_hosts -o ProxyCommand='ncat --proxy 127.0.0.1:2324 --proxy-type socks5 %h %p'" git push origin main
+```
