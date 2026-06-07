@@ -2,15 +2,18 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 // use anyhow::Context;
+use dashmap::{mapref::one::Ref, DashMap};
 use fast_socks5::{server::Socks5ServerProtocol, ReplyError, Result, Socks5Command, SocksError};
 use log::{debug, error, info};
+use russh::client;
 use russh::keys::{Certificate, *};
-use russh::server::{run_stream, Msg, Server as _, Session};
-use russh::*;
+use russh::server::{self, run_stream, Server as _};
+use russh::{Channel, ChannelId, Preferred};
 use ssh_key::private::{Ed25519Keypair, KeypairData};
 use std::time::Duration;
 use tokio::net::{self, TcpListener};
 // use tokio::sync::Mutex;
+use std::collections::HashMap;
 use tokio::task;
 
 use fast_socks5::server::ErrorContext;
@@ -19,6 +22,9 @@ use fast_socks5::util::stream::tcp_connect_with_timeout;
 use fast_socks5::util::target_addr::{AddrError, TargetAddr};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as StdToSocketAddrs};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{
+    MappedMutexGuard, Mutex, MutexGuard, OnceCell, RwLock, RwLockReadGuard, SetOnce,
+};
 
 #[derive(Clone)]
 struct Config {
@@ -28,38 +34,58 @@ struct Config {
 }
 
 #[derive(Clone)]
-struct Server {
-    // clients: Arc<Mutex<HashMap<usize, (ChannelId, russh::server::Handle)>>>,
-    // id: usize,
+struct Handler {
+    outbound_client_key: Arc<PrivateKey>,
+    // Requires mut
+    outbound_session: Arc<SetOnce<Mutex<russh::client::Handle<Self>>>>,
+    inbound_session: Arc<SetOnce<russh::server::Handle>>,
+    // inbound_outbound_chan_id_map: Arc<RwLock<Vec<Option<ChannelId>>>>,
+    // outbound_inbound_chan_id_map: Arc<RwLock<Vec<Option<ChannelId>>>>,
+    outbound_inbound_chan_id_map: Arc<DashMap<u32, ChannelId>>,
+    inbound_outbound_chan_map: Arc<DashMap<u32, Channel<client::Msg>>>,
 }
 
-// impl Server {
-//     async fn post(&mut self, data: Vec<u8>) {
-//         let mut clients = self.clients.lock().await;
-//         for (id, (channel, s)) in clients.iter_mut() {
-//             if *id != self.id {
-//                 let _ = s.data(*channel, data.clone()).await;
-//             }
-//         }
-//     }
-// }
-
-// impl server::Server for Server {
-//     type Handler = Handler;
-//     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self::Handler {
-//         Handler {}
-//     }
-//     fn handle_session_error(&mut self, _error: <Self::Handler as russh::server::Handler>::Error) {
-//         eprintln!("Session error: {_error:#?}");
-//     }
-// }
-
-struct Client {}
+impl Handler {
+    fn new(outbound_client_key: Arc<PrivateKey>) -> Self {
+        Self {
+            outbound_client_key,
+            outbound_session: Arc::new(SetOnce::new()),
+            inbound_session: Arc::new(SetOnce::new()),
+            // inbound_outbound_chan_id_map: Arc::new(RwLock::new(Vec::new())),
+            // outbound_inbound_chan_id_map: Arc::new(RwLock::new(Vec::new())),
+            outbound_inbound_chan_id_map: Arc::new(DashMap::new()),
+            inbound_outbound_chan_map: Arc::new(DashMap::new()),
+        }
+    }
+    async fn outbound_handle(&self) -> MutexGuard<russh::client::Handle<Self>> {
+        self.outbound_session.wait().await.lock().await
+    }
+    async fn inbound_handle(&self) -> &russh::server::Handle {
+        self.inbound_session.wait().await
+    }
+    fn inbound_chan_id_get(&self, outbound_id: ChannelId) -> ChannelId {
+        self.outbound_inbound_chan_id_map
+            .get(&u32::from(outbound_id))
+            .unwrap()
+            .clone()
+    }
+    fn chan_map_set(&self, inbound_id: ChannelId, outbound_chan: Channel<client::Msg>) {
+        self.outbound_inbound_chan_id_map
+            .insert(u32::from(outbound_chan.id()), inbound_id);
+        self.inbound_outbound_chan_map
+            .insert(u32::from(inbound_id), outbound_chan);
+    }
+    fn outbound_chan_get(&self, inbound_id: ChannelId) -> Ref<u32, Channel<client::Msg>> {
+        self.inbound_outbound_chan_map
+            .get(&u32::from(inbound_id))
+            .unwrap()
+    }
+}
 
 // More SSH event handlers
 // can be defined in this trait
 // In this example, we're only using Channel, so these aren't needed.
-impl client::Handler for Client {
+impl client::Handler for Handler {
     type Error = russh::Error;
 
     async fn check_server_key(
@@ -69,34 +95,111 @@ impl client::Handler for Client {
         // TODO: TOFU like OpenSSH
         Ok(true)
     }
-}
 
-// #[derive(Clone)]
-struct Handler {
-    outbound_client_key: Arc<PrivateKey>,
-    outbound_session: russh::client::Handle<Client>,
-}
+    #[allow(unused_variables)]
+    async fn channel_success(
+        &mut self,
+        channel: ChannelId,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        info!("client: channel success");
+        Ok(())
+    }
 
-// impl Handler {
-//     fn new() -> Self {
-//         Self {}
-//     }
-// }
+    #[allow(unused_variables)]
+    async fn channel_failure(
+        &mut self,
+        channel: ChannelId,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        info!("client: channel failure");
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let inbound_channel_id = self.inbound_chan_id_get(channel);
+        self.inbound_handle()
+            .await
+            .eof(inbound_channel_id)
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let inbound_channel_id = self.inbound_chan_id_get(channel);
+        self.inbound_handle()
+            .await
+            .close(inbound_channel_id)
+            .await
+            .unwrap();
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        info!(
+            "DBG outbound server data: {}",
+            String::from_utf8_lossy(data)
+        );
+        let inbound_channel_id = self.inbound_chan_id_get(channel);
+        self.inbound_handle()
+            .await
+            .data(inbound_channel_id, data.to_vec())
+            .await
+            .unwrap();
+        Ok(())
+    }
+}
 
 impl server::Handler for Handler {
     type Error = russh::Error;
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
-        _session: &mut Session,
+        channel: Channel<server::Msg>,
+        _session: &mut server::Session,
     ) -> Result<bool, Self::Error> {
-        info!("DBG channel_open_session");
+        info!("DBG channel_open_session {}", channel.id());
+        let outbound_channel = self.outbound_handle().await.channel_open_session().await?;
+        self.chan_map_set(channel.id(), outbound_channel);
         // {
         //     let mut clients = self.clients.lock().await;
         //     clients.insert(self.id, (channel.id(), session.handle()));
         // }
         Ok(true)
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        let outbound_channel = self.outbound_chan_get(channel);
+        outbound_channel.eof().await.unwrap();
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        let outbound_channel = self.outbound_chan_get(channel);
+        outbound_channel.close().await.unwrap();
+        Ok(())
     }
 
     async fn auth_publickey(
@@ -109,22 +212,25 @@ impl server::Handler for Handler {
             user,
             key.to_openssh().unwrap()
         );
+        let hash_alg = self
+            .outbound_handle()
+            .await
+            .best_supported_rsa_hash()
+            .await?
+            .flatten();
         let auth_res = self
-            .outbound_session
+            .outbound_handle()
+            .await
             .authenticate_publickey(
                 user,
-                PrivateKeyWithHashAlg::new(
-                    self.outbound_client_key.clone(),
-                    self.outbound_session
-                        .best_supported_rsa_hash()
-                        .await?
-                        .flatten(),
-                ),
+                PrivateKeyWithHashAlg::new(self.outbound_client_key.clone(), hash_alg),
             )
             .await?;
 
         if !auth_res.success() {
             panic!("Authentication (with publickey) failed");
+        } else {
+            info!("Authentication success");
         }
         Ok(server::Auth::Accept)
     }
@@ -142,36 +248,36 @@ impl server::Handler for Handler {
         &mut self,
         channel: ChannelId,
         data: &[u8],
-        session: &mut Session,
+        session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        info!("DBG exec_request: {}", String::from_utf8_lossy(data));
-        session.channel_success(channel)
+        info!(
+            "DBG exec_request chan {}: {}",
+            channel,
+            String::from_utf8_lossy(data)
+        );
+        // TODO: Allow or deny based on config
+        let outbound_channel = self.outbound_chan_get(channel);
+        outbound_channel.exec(true, data).await?;
+        // TODO: sync with client channel success/failure
+        session.channel_success(channel)?;
+        Ok(())
     }
 
     async fn data(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        _session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        info!("DBG data: {}", String::from_utf8_lossy(data));
+        info!("DBG inbound client data: {}", String::from_utf8_lossy(data));
+        let outbound_channel = self.outbound_chan_get(channel);
+        outbound_channel.data(data).await?;
         // let data = format!("Got data: {}\r\n", String::from_utf8_lossy(data)).into_bytes();
         // self.post(data.clone()).await;
         // session.data(channel, data)?;
         Ok(())
     }
 }
-
-// impl Drop for Server {
-//     fn drop(&mut self) {
-//         let id = self.id;
-//         let clients = self.clients.clone();
-//         tokio::spawn(async move {
-//             let mut clients = clients.lock().await;
-//             clients.remove(&id);
-//         });
-//     }
-// }
 
 /// # How to use it:
 ///
@@ -247,11 +353,19 @@ async fn main() -> Result<()> {
         "",
     )
     .unwrap();
+    info!(
+        "inbound server key: {}",
+        server_key.public_key().to_openssh().unwrap()
+    );
     let client_key = PrivateKey::new(
         KeypairData::Ed25519(Ed25519Keypair::from_seed(&[1; 32])),
         "",
     )
     .unwrap();
+    info!(
+        "outbound client key: {}",
+        client_key.public_key().to_openssh().unwrap()
+    );
 
     let config_ssh_server = russh::server::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
@@ -402,14 +516,20 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         .reply_success(outbound_stream.local_addr().expect("ok"))
         .await?;
 
-    let ssh_client = Client {};
+    let handler = Handler::new(config.outbound_client_key);
     let outbound_session =
-        match russh::client::connect_stream(config.ssh_client, outbound_stream, ssh_client).await {
+        match russh::client::connect_stream(config.ssh_client, outbound_stream, handler.clone())
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 panic!("Connection setup failed: {}", e);
             }
         };
+    handler
+        .outbound_session
+        .set(Mutex::new(outbound_session))
+        .unwrap_or_else(|_| panic!("todo"));
 
     // TODO
     // let auth_res = session
@@ -425,18 +545,17 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // if !auth_res.success() {
     //     anyhow::bail!("Authentication (with publickey) failed");
     // }
-
-    let handler = Handler {
-        outbound_client_key: config.outbound_client_key,
-        outbound_session,
-    };
-    let inbound_session = match run_stream(config.ssh_server, inbound_stream, handler).await {
+    let inbound_session = match run_stream(config.ssh_server, inbound_stream, handler.clone()).await
+    {
         Ok(s) => s,
         Err(e) => {
             panic!("Connection setup failed: {}", e);
         }
     };
-    let _handle = inbound_session.handle();
+    handler
+        .inbound_session
+        .set(inbound_session.handle())
+        .unwrap_or_else(|_| panic!("todo"));
 
     tokio::select! {
         result = inbound_session => {

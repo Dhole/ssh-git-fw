@@ -17,7 +17,23 @@ Currently the repository is just a skeleton of a server that accepts ssh connect
 
 # Testing
 
-Example:
+Build the docker image:
+```
+cd tests
+sudo docker build --tag ssh-git-test -f ssh.Dockerfile .
+```
+
+Run the docker ssh server with hardcoded keys:
+```
+sudo docker run -p 2222:22 ssh-git-test
+```
+
+Make a local repository and configure the remote:
+```
+git remote add [git@127.0.0.1:2222]:/git/test.git origin
+```
+
+Then use the proxy:
 ```
 GIT_SSH_COMMAND="ssh -o UserKnownHostsFile=/tmp/proxy-ssh-known_hosts -o ProxyCommand='ncat --proxy 127.0.0.1:2324 --proxy-type socks5 %h %p'" git push origin main
 ```
