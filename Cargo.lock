@@ -2052,6 +2052,7 @@ dependencies = [
  "rand",
  "russh",
  "serde",
+ "shlex",
  "structopt",
  "tokio",
  "toml",
