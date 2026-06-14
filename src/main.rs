@@ -2,7 +2,10 @@
 use std::collections::HashMap;
 use std::{cell::RefCell, rc::Rc, sync::OnceLock};
 
-use gtk4::{glib, prelude::*, Application, ApplicationWindow, Button};
+use gtk4::{
+    self as gtk, glib, prelude::*, Align, Application, ApplicationWindow, Button, Justification,
+    Label,
+};
 use std::{
     borrow::Cow,
     fs,
@@ -14,6 +17,7 @@ use std::{
 };
 use std::{cell::Cell, io, os::fd::AsRawFd as _};
 
+use async_channel::{Receiver, Sender};
 use dashmap::{mapref::one::Ref, DashMap};
 use fast_socks5::{
     server::{states, ErrorContext, Socks5ServerProtocol, SocksServerError},
@@ -36,7 +40,7 @@ use structopt::StructOpt;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{self, TcpListener},
-    sync::mpsc::{self, Receiver, Sender},
+    // sync::mpsc::{self, Receiver, Sender},
     sync::{MappedMutexGuard, Mutex, MutexGuard, OnceCell, RwLock, RwLockReadGuard, SetOnce},
     task,
     time::sleep,
@@ -57,26 +61,30 @@ struct ClientRules {
     servers: HashMap<String, ServerRules>,
 }
 
-struct UserRequest {
+enum UiRequest {
+    Permission(PermissionRequest),
+}
+
+struct PermissionRequest {
     pk_openssh: String,
     action: String,
     reply: Arc<SetOnce<(bool, Permission)>>,
 }
 
-struct UserRequestHandler {
+struct RequestHandler {
     pk_openssh: String,
-    tx: Sender<UserRequest>,
+    tx: Sender<UiRequest>,
 }
 
-impl UserRequestHandler {
+impl RequestHandler {
     async fn request(&self, action: String) -> (bool, Permission) {
         let reply = Arc::new(SetOnce::new());
-        let req = UserRequest {
+        let req = PermissionRequest {
             pk_openssh: self.pk_openssh.clone(),
             action,
             reply: reply.clone(),
         };
-        self.tx.send(req).await.unwrap();
+        self.tx.send(UiRequest::Permission(req)).await.unwrap();
         reply.wait().await.clone()
     }
 }
@@ -84,7 +92,7 @@ impl UserRequestHandler {
 impl ClientRules {
     async fn validate_exec(
         &self,
-        handler: &UserRequestHandler,
+        handler: &RequestHandler,
         server_addr: &str,
         user: &str,
         data: &str,
@@ -124,7 +132,7 @@ impl GitRules {
     }
     async fn validate_exec(
         &self,
-        handler: &UserRequestHandler,
+        handler: &RequestHandler,
         _user: &str,
         data: &str,
     ) -> Result<(), String> {
@@ -202,7 +210,7 @@ struct Setup {
     ssh_client: Arc<russh::client::Config>,
     outbound_client_key: PrivateKey,
     request_timeout: Duration,
-    tx_user_req: Sender<UserRequest>,
+    req_tx: Sender<UiRequest>,
 }
 
 struct SessionState {
@@ -217,7 +225,7 @@ struct SessionState {
     outbound_session: SetOnce<Mutex<russh::client::Handle<Handler>>>,
     inbound_session: SetOnce<russh::server::Handle>,
     client_rules: SetOnce<ClientRules>,
-    tx_user_req: Sender<UserRequest>,
+    req_tx: Sender<UiRequest>,
     //
     // Dynamic
     //
@@ -242,7 +250,7 @@ impl SessionState {
         outbound_server_addr: TargetAddr,
         outbound_client_key: PrivateKey,
         rules: Arc<RwLock<Rules>>,
-        tx_user_req: Sender<UserRequest>,
+        req_tx: Sender<UiRequest>,
     ) -> Self {
         Self {
             outbound_server_addr,
@@ -252,7 +260,7 @@ impl SessionState {
             outbound_session: SetOnce::new(),
             inbound_session: SetOnce::new(),
             client_rules: SetOnce::new(),
-            tx_user_req,
+            req_tx,
             outbound_inbound_chan_id_map: DashMap::new(),
             inbound_outbound_chan_map: DashMap::new(),
             rules,
@@ -314,10 +322,10 @@ impl SessionState {
             self.client_rules.get().expect("just set")
         }
     }
-    fn user_req_handler(&self) -> UserRequestHandler {
-        UserRequestHandler {
+    fn user_req_handler(&self) -> RequestHandler {
+        RequestHandler {
             pk_openssh: self.inbound_client_pk_openssh().to_string(),
-            tx: self.tx_user_req.clone(),
+            tx: self.req_tx.clone(),
         }
     }
 }
@@ -581,7 +589,7 @@ fn main() -> glib::ExitCode {
     let rules: Rules = toml::from_slice(&rules_toml).unwrap();
     let rules = Arc::new(RwLock::new(rules));
 
-    let addr = &config.inbound_server_address;
+    let addr = config.inbound_server_address.clone();
 
     info!("Listen for socks connections @ {}", addr);
 
@@ -631,13 +639,17 @@ fn main() -> glib::ExitCode {
 
     let local = task::LocalSet::new();
 
-    let (tx_user_req, mut rx_user_req) = mpsc::channel::<UserRequest>(16);
+    //     let (tx_user_req, mut rx_user_req) = mpsc::channel::<PermissionRequest>(16);
+
+    // GLib-native channel: tokio thread → GTK main loop
+    // The Sender is Send, the Receiver integrates with the GLib event loop
+    let (req_tx, req_rx) = async_channel::bounded::<UiRequest>(16);
     let setup = Setup {
         ssh_server: Arc::new(config_ssh_server),
         ssh_client: Arc::new(config_ssh_client),
         outbound_client_key: client_key,
         request_timeout: Duration::from_secs(5),
-        tx_user_req,
+        req_tx,
     };
 
     let app = Application::builder().build();
@@ -645,7 +657,7 @@ fn main() -> glib::ExitCode {
 
     // let window_slot: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
 
-    // gtk4::init().unwrap();
+    // gtk::init().unwrap();
     // let win = ApplicationWindow::builder()
     //     .application(&app)
     //     .title("My App")
@@ -659,47 +671,43 @@ fn main() -> glib::ExitCode {
     // });
     // let win = Arc::new(win);
 
-    // GLib-native channel: tokio thread → GTK main loop
-    // The Sender is Send, the Receiver integrates with the GLib event loop
-    let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
-
     // Spawn the tokio task — sends a wakeup every 10 seconds
+    // runtime().spawn(async move {
+    //     loop {
+    //         if req_tx.send(()).await.is_err() {
+    //             break; // GTK side shut down
+    //         }
+    //         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    //     }
+    // });
+
+    // Standard TCP loop
     runtime().spawn(async move {
+        let listener = TcpListener::bind(addr).await.unwrap();
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-            if wake_tx.send(()).await.is_err() {
-                break; // GTK side shut down
+            match listener.accept().await {
+                Ok((socket, _client_addr)) => {
+                    let setup = setup.clone();
+                    let rules = rules.clone();
+                    task::spawn(async move {
+                        match serve_socks5(socket, setup, rules).await {
+                            Ok(()) => {}
+                            Err(err) => error!("{:#}", &err),
+                        }
+                    });
+                }
+                Err(err) => {
+                    error!("accept error = {:?}", err);
+                }
             }
         }
     });
-
-    // Standard TCP loop
-    // let tcp_loop_handle = task::spawn(async move {
-    //     let listener = TcpListener::bind(addr).await?;
-    //     loop {
-    //         match listener.accept().await {
-    //             Ok((socket, _client_addr)) => {
-    //                 let setup = setup.clone();
-    //                 let rules = rules.clone();
-    //                 task::spawn(async move {
-    //                     match serve_socks5(socket, setup, rules).await {
-    //                         Ok(()) => {}
-    //                         Err(err) => error!("{:#}", &err),
-    //                     }
-    //                 });
-    //             }
-    //             Err(err) => {
-    //                 error!("accept error = {:?}", err);
-    //             }
-    //         }
-    //     }
-    // });
 
     // while let Some(req) = rx_user_req.recv().await {
     //     req.reply.set((true, Permission::Ask)).unwrap();
     // }
 
-    let wake_rx = Rc::new(RefCell::new(Some(wake_rx)));
+    let req_rx = Rc::new(RefCell::new(Some(req_rx)));
     app.connect_startup({
         // let window_slot = window_slot.clone();
         // let win = win.clone();
@@ -712,35 +720,81 @@ fn main() -> glib::ExitCode {
 
             let app = app.clone();
             // Receive wakeups on the GTK main loop via glib::spawn_future_local
-            let wake_rx = wake_rx.borrow_mut().take().unwrap();
+            let req_rx = req_rx.borrow_mut().take().unwrap();
             // let wake_rx = wake_rx.clone();
             glib::spawn_future_local(async move {
-                while wake_rx.recv().await.is_ok() {
-                    let button = Button::builder()
-                        .label("Press me!")
-                        .margin_top(12)
-                        .margin_bottom(12)
-                        .margin_start(12)
-                        .margin_end(12)
-                        .build();
-
-                    button.connect_clicked(|button| {
-                        // Set the label to "Hello World!" after the button has been clicked on
-                        button.set_label("Hello World!");
-                    });
-
+                while let Ok(req) = req_rx.recv().await {
                     let win = ApplicationWindow::builder()
                         .application(&app)
-                        .title("My App")
-                        .default_width(400)
-                        .default_height(300)
-                        .child(&button)
+                        .title("proxy-fw-ssh")
+                        .default_width(32)
+                        .default_height(32)
                         .build();
+                    match req {
+                        UiRequest::Permission(r) => {
+                            win.connect_close_request({
+                                let reply = r.reply.clone();
+                                move |w| {
+                                    reply.set((false, Permission::Ask)).unwrap_or_default();
+                                    w.set_visible(false);
+                                    glib::Propagation::Stop
+                                }
+                            });
+                            let grid = gtk::Grid::builder()
+                                .margin_start(6)
+                                .margin_end(6)
+                                .margin_top(6)
+                                .margin_bottom(6)
+                                .halign(gtk::Align::Center)
+                                .valign(gtk::Align::Center)
+                                .row_spacing(6)
+                                .column_spacing(6)
+                                .build();
+                            win.set_child(Some(&grid));
+                            let label = Label::builder().justify(Justification::Center).build();
+                            label.set_markup(&format!(
+                                concat!("Allow\n", "<b>{}</b>\n", "to {}?"),
+                                r.pk_openssh, r.action
+                            ));
 
-                    win.connect_close_request(|w| {
-                        w.set_visible(false);
-                        glib::Propagation::Stop
-                    });
+                            let btn_allow = Button::builder().label("Allow always").build();
+                            let btn_allow_once = Button::builder().label("Allow once").build();
+                            let btn_deny = Button::builder().label("Deny always").build();
+
+                            btn_allow.connect_clicked({
+                                let win = win.clone();
+                                let reply = r.reply.clone();
+                                move |button| {
+                                    println!("DBG allow always");
+                                    reply.set((true, Permission::Yes)).unwrap();
+                                    win.close();
+                                }
+                            });
+                            btn_allow_once.connect_clicked({
+                                let win = win.clone();
+                                let reply = r.reply.clone();
+                                move |button| {
+                                    println!("DBG allow once");
+                                    reply.set((true, Permission::Ask)).unwrap();
+                                    win.close();
+                                }
+                            });
+                            btn_deny.connect_clicked({
+                                let win = win.clone();
+                                let reply = r.reply.clone();
+                                move |button| {
+                                    println!("DBG deny always");
+                                    reply.set((false, Permission::No)).unwrap();
+                                    win.close();
+                                }
+                            });
+
+                            grid.attach(&label, 0, 0, 3, 1);
+                            grid.attach(&btn_allow, 0, 1, 1, 1);
+                            grid.attach(&btn_allow_once, 1, 1, 1, 1);
+                            grid.attach(&btn_deny, 2, 1, 1, 1);
+                        }
+                    }
 
                     win.present();
                 }
@@ -852,7 +906,7 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         target_addr,
         setup.outbound_client_key,
         rules,
-        setup.tx_user_req,
+        setup.req_tx,
     )));
     let outbound_session =
         match russh::client::connect_stream(setup.ssh_client, outbound_stream, handler.clone())
