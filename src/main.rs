@@ -1,5 +1,8 @@
 // use tokio::sync::Mutex;
 use std::collections::HashMap;
+use std::{cell::RefCell, rc::Rc, sync::OnceLock};
+
+use gtk4::{glib, prelude::*, Application, ApplicationWindow};
 use std::{
     borrow::Cow,
     fs,
@@ -9,7 +12,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use std::{cell::Cell, io, os::fd::AsRawFd as _, rc::Rc};
+use std::{cell::Cell, io, os::fd::AsRawFd as _};
 
 use dashmap::{mapref::one::Ref, DashMap};
 use fast_socks5::{
@@ -559,19 +562,26 @@ struct Opt {
     pub rules: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+const APP_ID: &str = "com.example.MyApp";
+
+use tokio::runtime::Runtime;
+
+fn runtime() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| Runtime::new().expect("tokio runtime setup failed"))
+}
+
+fn main() -> glib::ExitCode {
     env_logger::init();
 
     let opt = Opt::from_args();
-    let config_toml = fs::read(opt.config)?;
+    let config_toml = fs::read(opt.config).expect("TODO");
     let config: Config = toml::from_slice(&config_toml).unwrap();
-    let rules_toml = fs::read(opt.rules)?;
+    let rules_toml = fs::read(opt.rules).expect("TODO");
     let rules: Rules = toml::from_slice(&rules_toml).unwrap();
     let rules = Arc::new(RwLock::new(rules));
 
     let addr = &config.inbound_server_address;
-    let listener = TcpListener::bind(addr).await?;
 
     info!("Listen for socks connections @ {}", addr);
 
@@ -630,32 +640,95 @@ async fn main() -> Result<()> {
         tx_user_req,
     };
 
-    // Standard TCP loop
-    let tcp_loop_handle = task::spawn(async move {
+    let app = Application::builder().application_id(APP_ID).build();
+
+    let window_slot: Rc<RefCell<Option<ApplicationWindow>>> = Rc::new(RefCell::new(None));
+
+    // GLib-native channel: tokio thread → GTK main loop
+    // The Sender is Send, the Receiver integrates with the GLib event loop
+    let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
+
+    // Spawn the tokio task — sends a wakeup every 30 seconds
+    runtime().spawn(async move {
         loop {
-            match listener.accept().await {
-                Ok((socket, _client_addr)) => {
-                    let setup = setup.clone();
-                    let rules = rules.clone();
-                    task::spawn(async move {
-                        match serve_socks5(socket, setup, rules).await {
-                            Ok(()) => {}
-                            Err(err) => error!("{:#}", &err),
-                        }
-                    });
-                }
-                Err(err) => {
-                    error!("accept error = {:?}", err);
-                }
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            if wake_tx.send(()).await.is_err() {
+                break; // GTK side shut down
             }
         }
     });
 
-    while let Some(req) = rx_user_req.recv().await {
-        req.reply.set((true, Permission::Ask)).unwrap();
-    }
+    // Standard TCP loop
+    // let tcp_loop_handle = task::spawn(async move {
+    //     let listener = TcpListener::bind(addr).await?;
+    //     loop {
+    //         match listener.accept().await {
+    //             Ok((socket, _client_addr)) => {
+    //                 let setup = setup.clone();
+    //                 let rules = rules.clone();
+    //                 task::spawn(async move {
+    //                     match serve_socks5(socket, setup, rules).await {
+    //                         Ok(()) => {}
+    //                         Err(err) => error!("{:#}", &err),
+    //                     }
+    //                 });
+    //             }
+    //             Err(err) => {
+    //                 error!("accept error = {:?}", err);
+    //             }
+    //         }
+    //     }
+    // });
 
-    Ok(())
+    // while let Some(req) = rx_user_req.recv().await {
+    //     req.reply.set((true, Permission::Ask)).unwrap();
+    // }
+
+    let wake_rx = Rc::new(RefCell::new(Some(wake_rx)));
+    app.connect_startup({
+        let app = app.clone();
+        let window_slot = window_slot.clone();
+        move |_| {
+            app.hold();
+
+            // Receive wakeups on the GTK main loop via glib::spawn_future_local
+            let wake_rx = wake_rx.borrow_mut().take().unwrap();
+            let window_slot = window_slot.clone();
+            glib::spawn_future_local(async move {
+                while wake_rx.recv().await.is_ok() {
+                    if let Some(win) = window_slot.borrow().as_ref() {
+                        win.present();
+                    }
+                }
+            });
+        }
+    });
+
+    app.connect_activate({
+        let app = app.clone();
+        move |_| {
+            let mut slot = window_slot.borrow_mut();
+            if slot.is_none() {
+                let win = ApplicationWindow::builder()
+                    .application(&app)
+                    .title("My App")
+                    .default_width(400)
+                    .default_height(300)
+                    .build();
+
+                win.connect_close_request(|w| {
+                    w.set_visible(false);
+                    glib::Propagation::Stop
+                });
+
+                *slot = Some(win);
+            }
+
+            slot.as_ref().unwrap().present();
+        }
+    });
+
+    app.run_with_args::<glib::GString>(&[])
 }
 
 async fn serve_socks5(

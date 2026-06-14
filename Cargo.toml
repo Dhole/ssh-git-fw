@@ -16,3 +16,5 @@ bytes = "1.11.1"
 serde = { version = "1.0.228", features = ["derive"] }
 structopt = "0.3.26"
 shlex = "2.0.1"
+gtk4 = "0.11.3"
+async-channel = "2.5.0"
