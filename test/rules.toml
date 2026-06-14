@@ -3,6 +3,6 @@ name = "test-env"
 
 servers."127.0.0.1:2222" = {
     git = {
-        "/git/test1.git" = { read = "yes", write = "yes" },
+        "/git/test1.git" = { read = "ask", write = "ask" },
     }
 }

@@ -9,8 +9,8 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use std::{cell::Cell, io, os::fd::AsRawFd as _, rc::Rc};
 
-// use anyhow::Context;
 use dashmap::{mapref::one::Ref, DashMap};
 use fast_socks5::{
     server::{states, ErrorContext, Socks5ServerProtocol, SocksServerError},
@@ -33,6 +33,7 @@ use structopt::StructOpt;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{self, TcpListener},
+    sync::mpsc::{self, Receiver, Sender},
     sync::{MappedMutexGuard, Mutex, MutexGuard, OnceCell, RwLock, RwLockReadGuard, SetOnce},
     task,
     time::sleep,
@@ -53,18 +54,52 @@ struct ClientRules {
     servers: HashMap<String, ServerRules>,
 }
 
+struct UserRequest {
+    pk_openssh: String,
+    action: String,
+    reply: Arc<SetOnce<(bool, Permission)>>,
+}
+
+struct UserRequestHandler {
+    pk_openssh: String,
+    tx: Sender<UserRequest>,
+}
+
+impl UserRequestHandler {
+    async fn request(&self, action: String) -> (bool, Permission) {
+        let reply = Arc::new(SetOnce::new());
+        let req = UserRequest {
+            pk_openssh: self.pk_openssh.clone(),
+            action,
+            reply: reply.clone(),
+        };
+        self.tx.send(req).await.unwrap();
+        reply.wait().await.clone()
+    }
+}
+
 impl ClientRules {
-    fn validate_exec(&self, server_addr: &str, user: &str, data: &str) -> Result<(), String> {
+    async fn validate_exec(
+        &self,
+        handler: &UserRequestHandler,
+        server_addr: &str,
+        user: &str,
+        data: &str,
+    ) -> Result<(), String> {
         let Some(server_rules) = self.servers.get(server_addr) else {
             return Err(format!("server {} not in rules", server_addr));
         };
-        if user == "git" {
+        if GitRules::matches_exec(user, data) {
             return server_rules
                 .git
-                .validate_exec(data)
+                .validate_exec(handler, user, data)
+                .await
                 .map_err(|e| format!("git: {}", e));
         }
-        return Err("invalid user".to_string());
+        return Err(format!(
+            "no plugin matches with user:{}, data:{}",
+            user, data
+        ));
     }
 }
 
@@ -80,7 +115,16 @@ struct GitRules {
 }
 
 impl GitRules {
-    fn validate_exec(&self, data: &str) -> Result<(), String> {
+    fn matches_exec(user: &str, data: &str) -> bool {
+        user == "git"
+            && (data.starts_with("git-upload-pack") || data.starts_with("git-receive-pack"))
+    }
+    async fn validate_exec(
+        &self,
+        handler: &UserRequestHandler,
+        _user: &str,
+        data: &str,
+    ) -> Result<(), String> {
         let Some(args) = shlex::split(data) else {
             return Err("parsing command".to_string());
         };
@@ -91,15 +135,34 @@ impl GitRules {
             return Err("missing arg1".to_string());
         };
         let access_rule = self.paths.get(arg1).cloned().unwrap_or_default();
-        if arg0 == "git-upload-pack" && access_rule.read() {
-            Ok(())
-        } else if arg0 == "git-receive-pack" && access_rule.write() {
-            Ok(())
-        } else {
-            return Err(format!(
-                "invalid command {} or path {} not allowed.  access_rule={:?}",
-                arg0, arg1, access_rule
-            ));
+        match arg0.as_str() {
+            "git-upload-pack" => match access_rule.read {
+                Permission::Yes => Ok(()),
+                Permission::No => Err("read not allowed".to_string()),
+                Permission::Ask => {
+                    let (r, _perm) = handler.request(format!("read from {}", arg1)).await;
+                    if r {
+                        Ok(())
+                    } else {
+                        Err("interactively denied".to_string())
+                    }
+                    // TODO: update rules with _perm
+                }
+            },
+            "git-receive-pack" => match access_rule.write {
+                Permission::Yes => Ok(()),
+                Permission::No => Err("write not allowed".to_string()),
+                Permission::Ask => {
+                    let (r, _perm) = handler.request(format!("write to {}", arg1)).await;
+                    if r {
+                        Ok(())
+                    } else {
+                        Err("interactively denied".to_string())
+                    }
+                    // TODO: update rules with _perm
+                }
+            },
+            _ => Err(format!("invalid command {}", arg0)),
         }
     }
 }
@@ -136,6 +199,7 @@ struct Setup {
     ssh_client: Arc<russh::client::Config>,
     outbound_client_key: PrivateKey,
     request_timeout: Duration,
+    tx_user_req: Sender<UserRequest>,
 }
 
 struct SessionState {
@@ -150,6 +214,7 @@ struct SessionState {
     outbound_session: SetOnce<Mutex<russh::client::Handle<Handler>>>,
     inbound_session: SetOnce<russh::server::Handle>,
     client_rules: SetOnce<ClientRules>,
+    tx_user_req: Sender<UserRequest>,
     //
     // Dynamic
     //
@@ -174,6 +239,7 @@ impl SessionState {
         outbound_server_addr: TargetAddr,
         outbound_client_key: PrivateKey,
         rules: Arc<RwLock<Rules>>,
+        tx_user_req: Sender<UserRequest>,
     ) -> Self {
         Self {
             outbound_server_addr,
@@ -183,6 +249,7 @@ impl SessionState {
             outbound_session: SetOnce::new(),
             inbound_session: SetOnce::new(),
             client_rules: SetOnce::new(),
+            tx_user_req,
             outbound_inbound_chan_id_map: DashMap::new(),
             inbound_outbound_chan_map: DashMap::new(),
             rules,
@@ -242,6 +309,12 @@ impl SessionState {
             // This set could be raced but the value would be the same, so we ignore the error
             self.client_rules.set(client_rules).unwrap_or_default();
             self.client_rules.get().expect("just set")
+        }
+    }
+    fn user_req_handler(&self) -> UserRequestHandler {
+        UserRequestHandler {
+            pk_openssh: self.inbound_client_pk_openssh().to_string(),
+            tx: self.tx_user_req.clone(),
         }
     }
 }
@@ -438,10 +511,12 @@ impl server::Handler for Handler {
         );
         let server_addr = format!("{}", self.outbound_server_addr);
         let data = str::from_utf8(data).expect("TODO");
+        let user_req_handler = self.user_req_handler();
         match self
             .client_rules()
             .await
-            .validate_exec(&server_addr, user, data)
+            .validate_exec(&user_req_handler, &server_addr, user, data)
+            .await
         {
             Ok(()) => info!("approved exec"),
 
@@ -544,31 +619,43 @@ async fn main() -> Result<()> {
         ..<_>::default()
     };
 
+    let local = task::LocalSet::new();
+
+    let (tx_user_req, mut rx_user_req) = mpsc::channel::<UserRequest>(16);
     let setup = Setup {
         ssh_server: Arc::new(config_ssh_server),
         ssh_client: Arc::new(config_ssh_client),
         outbound_client_key: client_key,
         request_timeout: Duration::from_secs(5),
+        tx_user_req,
     };
 
     // Standard TCP loop
-    loop {
-        match listener.accept().await {
-            Ok((socket, _client_addr)) => {
-                let setup = setup.clone();
-                let rules = rules.clone();
-                task::spawn(async move {
-                    match serve_socks5(socket, setup, rules).await {
-                        Ok(()) => {}
-                        Err(err) => error!("{:#}", &err),
-                    }
-                });
-            }
-            Err(err) => {
-                error!("accept error = {:?}", err);
+    let tcp_loop_handle = task::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((socket, _client_addr)) => {
+                    let setup = setup.clone();
+                    let rules = rules.clone();
+                    task::spawn(async move {
+                        match serve_socks5(socket, setup, rules).await {
+                            Ok(()) => {}
+                            Err(err) => error!("{:#}", &err),
+                        }
+                    });
+                }
+                Err(err) => {
+                    error!("accept error = {:?}", err);
+                }
             }
         }
+    });
+
+    while let Some(req) = rx_user_req.recv().await {
+        req.reply.set((true, Permission::Ask)).unwrap();
     }
+
+    Ok(())
 }
 
 async fn serve_socks5(
@@ -667,6 +754,7 @@ async fn run_tcp_proxy<T: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         target_addr,
         setup.outbound_client_key,
         rules,
+        setup.tx_user_req,
     )));
     let outbound_session =
         match russh::client::connect_stream(setup.ssh_client, outbound_stream, handler.clone())
